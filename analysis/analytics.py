@@ -3,6 +3,7 @@ import glob
 import pandas as pd
 from collections import defaultdict
 import matplotlib.pyplot as plt
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 DEMO_DIR = os.path.join(BASE_DIR, 'api_data_aadhar_demographic')
@@ -106,6 +107,105 @@ def main():
         make_bar(df_guj_demo['total_updates'].head(15), 'Top Gujarat Districts (Demographic)', os.path.join(OUT_DIR, 'gujarat_demographic_top15.png'))
     if not df_guj_bio.empty:
         make_bar(df_guj_bio['total_updates'].head(15), 'Top Gujarat Districts (Biometric)', os.path.join(OUT_DIR, 'gujarat_biometric_top15.png'))
+
+    # --- Forecasting (Holt-Winters) for top 5 states and Gujarat top 5 districts ---
+    forecast_dir = os.path.join(OUT_DIR, 'forecasts')
+    os.makedirs(forecast_dir, exist_ok=True)
+
+    def build_daily_aggregates(folder, prefix):
+        # returns DataFrame with columns ['state','district','date','total_updates']
+        rows = []
+        file_list = sorted(glob.glob(os.path.join(folder, '*.csv')))
+        for fp in file_list:
+            for chunk in pd.read_csv(fp, chunksize=CHUNKSIZE):
+                chunk.columns = clean_columns(chunk.columns)
+                date_col = DATE_COL if DATE_COL in chunk.columns else 'date'
+                age_cols = [c for c in chunk.columns if c.startswith(f'{prefix}_age')]
+                if not age_cols or 'state' not in chunk.columns:
+                    continue
+                # total updates per row
+                chunk['total_updates'] = chunk[age_cols].fillna(0).sum(axis=1)
+                # parse date
+                try:
+                    chunk['date'] = pd.to_datetime(chunk[date_col], dayfirst=True, errors='coerce')
+                except Exception:
+                    chunk['date'] = pd.to_datetime(chunk[date_col], errors='coerce')
+                chunk = chunk.dropna(subset=['date'])
+                grp = chunk.groupby(['state', 'district', 'date'])['total_updates'].sum().reset_index()
+                rows.append(grp)
+        if rows:
+            df = pd.concat(rows, ignore_index=True)
+            return df
+        return pd.DataFrame(columns=['state', 'district', 'date', 'total_updates'])
+
+    demo_daily = build_daily_aggregates(DEMO_DIR, 'demo')
+
+    def fit_and_forecast(series, periods):
+        # resample weekly to reduce noise
+        s = series.resample('W').sum()
+        # choose seasonal if enough data
+        seasonal = None
+        sp = None
+        if len(s) >= 26:
+            # assume yearly seasonality on weekly data (~52)
+            seasonal = 'add'
+            sp = 52
+        try:
+            model = ExponentialSmoothing(s, trend='add', seasonal=seasonal, seasonal_periods=sp, damped_trend=False)
+            fit = model.fit(optimized=True)
+            fc = fit.forecast(periods)
+            return s, fc
+        except Exception:
+            # fallback: simple last-value repeat
+            fc = pd.Series([s.mean()] * periods, index=pd.date_range(s.index[-1] + pd.Timedelta(weeks=1), periods=periods, freq='W'))
+            return s, fc
+
+    horizon_weeks = 12  # ~3 months
+
+    # Top 5 states by demographic totals
+    top_states = []
+    if not df_state_demo.empty:
+        top_states = list(df_state_demo.index[:5])
+
+    for st in top_states:
+        ser = demo_daily[demo_daily['state'].str.strip().str.lower() == st.strip().lower()]
+        if ser.empty:
+            continue
+        ts = ser.groupby('date')['total_updates'].sum()
+        ts.index = pd.to_datetime(ts.index)
+        hist, fc = fit_and_forecast(ts, horizon_weeks)
+        # save CSV and chart
+        out_csv = os.path.join(forecast_dir, f'state_{st.replace(" ","_")}_forecast.csv')
+        pd.concat([hist.rename('historical'), fc.rename('forecast')], axis=1).to_csv(out_csv)
+        plt.figure(figsize=(10, 5))
+        hist.plot(label='historical')
+        fc.plot(label='forecast')
+        plt.title(f'Weekly updates - {st}')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(forecast_dir, f'state_{st.replace(" ","_")}_forecast.png'))
+        plt.close()
+
+    # Gujarat top 5 districts (demographic)
+    guj = df_guj_demo
+    guj_top5 = list(guj.index[:5]) if not guj.empty else []
+    for dist in guj_top5:
+        ser = demo_daily[(demo_daily['state'].str.strip().str.lower() == 'gujarat') & (demo_daily['district'].str.strip().str.lower() == dist.strip().lower())]
+        if ser.empty:
+            continue
+        ts = ser.groupby('date')['total_updates'].sum()
+        ts.index = pd.to_datetime(ts.index)
+        hist, fc = fit_and_forecast(ts, horizon_weeks)
+        out_csv = os.path.join(forecast_dir, f'gujarat_{dist.replace(" ","_")}_forecast.csv')
+        pd.concat([hist.rename('historical'), fc.rename('forecast')], axis=1).to_csv(out_csv)
+        plt.figure(figsize=(10, 5))
+        hist.plot(label='historical')
+        fc.plot(label='forecast')
+        plt.title(f'Weekly updates - Gujarat / {dist}')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(forecast_dir, f'gujarat_{dist.replace(" ","_")}_forecast.png'))
+        plt.close()
 
     # Simple report
     with open(os.path.join(OUT_DIR, 'analytics_report.md'), 'w') as f:
