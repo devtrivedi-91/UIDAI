@@ -207,6 +207,101 @@ def main():
         plt.savefig(os.path.join(forecast_dir, f'gujarat_{dist.replace(" ","_")}_forecast.png'))
         plt.close()
 
+    # --- Age-group breakdown charts ---
+    def age_group_charts(folder, prefix, out_prefix):
+        # aggregate age columns by state and Gujarat districts
+        file_list = sorted(glob.glob(os.path.join(folder, '*.csv')))
+        acc_state = defaultdict(lambda: defaultdict(int))
+        acc_guj = defaultdict(lambda: defaultdict(int))
+        for fp in file_list:
+            for chunk in pd.read_csv(fp, chunksize=CHUNKSIZE):
+                chunk.columns = clean_columns(chunk.columns)
+                age_cols = [c for c in chunk.columns if c.startswith(f'{prefix}_age')]
+                if not age_cols or 'state' not in chunk.columns:
+                    continue
+                chunk[age_cols] = chunk[age_cols].fillna(0)
+                grp_state = chunk.groupby('state')[age_cols].sum()
+                for state, row in grp_state.iterrows():
+                    for c in age_cols:
+                        acc_state[state][c] += int(row[c])
+                gch = chunk[chunk['state'].str.strip().str.lower() == 'gujarat']
+                if not gch.empty and 'district' in gch.columns:
+                    grp_dist = gch.groupby('district')[age_cols].sum()
+                    for dist, row in grp_dist.iterrows():
+                        for c in age_cols:
+                            acc_guj[dist][c] += int(row[c])
+
+        # make charts for top 10 states by total
+        df_states = dict_to_df(acc_state)
+        if not df_states.empty:
+            top_states = df_states.head(10)
+            for st in top_states.index:
+                row = top_states.loc[st]
+                # select age columns
+                age_cols = [c for c in row.index if c.startswith(f'{prefix}_age')]
+                series = row[age_cols]
+                plt.figure(figsize=(8, 4))
+                series.plot(kind='bar', color='C2')
+                plt.title(f'Age breakdown — {st}')
+                plt.ylabel('Total updates')
+                plt.tight_layout()
+                plt.savefig(os.path.join(OUT_DIR, f'{out_prefix}_{st.replace(" ","_")}_agebreak.png'))
+                plt.close()
+
+        # Gujarat districts top 10
+        df_guj = dict_to_df(acc_guj)
+        if not df_guj.empty:
+            for dist in df_guj.head(10).index:
+                row = df_guj.loc[dist]
+                age_cols = [c for c in row.index if c.startswith(f'{prefix}_age')]
+                series = row[age_cols]
+                plt.figure(figsize=(8, 4))
+                series.plot(kind='bar', color='C3')
+                plt.title(f'Age breakdown — Gujarat / {dist}')
+                plt.ylabel('Total updates')
+                plt.tight_layout()
+                plt.savefig(os.path.join(OUT_DIR, f'{out_prefix}_Gujarat_{dist.replace(" ","_")}_agebreak.png'))
+                plt.close()
+
+    age_group_charts(DEMO_DIR, 'demo', 'demo')
+    age_group_charts(BIO_DIR, 'bio', 'bio')
+
+    # --- Service-demand indicators ---
+    indicators = []
+    import glob as _glob
+    fc_files = sorted(_glob.glob(os.path.join(forecast_dir, '*.csv')))
+    for fc in fc_files:
+        name = os.path.basename(fc).replace('_forecast.csv', '')
+        df = pd.read_csv(fc, index_col=0, parse_dates=True)
+        # last historical avg (last 4 weeks)
+        if 'historical' in df.columns:
+            hist = df['historical'].dropna()
+            recent_avg = hist.tail(4).mean() if len(hist) >= 1 else 0
+        else:
+            recent_avg = 0
+        # forecast peak
+        if 'forecast' in df.columns:
+            peak_val = df['forecast'].max()
+            peak_idx = df['forecast'].idxmax()
+        else:
+            peak_val = None
+            peak_idx = None
+        indicators.append({'series': name, 'recent_avg_weekly': float(recent_avg or 0), 'forecast_peak_week': str(peak_idx), 'forecast_peak_value': float(peak_val) if peak_val is not None else None})
+
+    import csv
+    with open(os.path.join(OUT_DIR, 'service_demand_indicators.csv'), 'w', newline='') as cf:
+        writer = csv.DictWriter(cf, fieldnames=['series', 'recent_avg_weekly', 'forecast_peak_week', 'forecast_peak_value'])
+        writer.writeheader()
+        for r in indicators:
+            writer.writerow(r)
+
+    # add to report
+    with open(os.path.join(OUT_DIR, 'analytics_report.md'), 'a') as f:
+        f.write('\n## Age-group breakdown charts\n\n')
+        f.write('- Age-group breakdown charts for top states and Gujarat top districts saved in `analysis/outputs/` as PNGs.\n')
+        f.write('\n## Service-demand indicators\n\n')
+        f.write('- Summary CSV: `analysis/outputs/service_demand_indicators.csv` with recent weekly averages and forecast peak weeks/values.\n')
+
     # Simple report
     with open(os.path.join(OUT_DIR, 'analytics_report.md'), 'w') as f:
         f.write('# Aadhaar Analytics Report\n\n')
